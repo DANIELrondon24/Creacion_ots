@@ -1,0 +1,21 @@
+# Sensitive / local
+.env
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.DS_Store
+desktop.ini
+
+# Data files (avoid committing local inputs/outputs)
+*.xlsx
+*.xls
+*.xlsm
+*.csv
