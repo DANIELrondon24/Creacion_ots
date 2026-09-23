@@ -19,3 +19,7 @@ desktop.ini
 *.xls
 *.xlsm
 *.csv
+
+# Server runtime
+data/
+logs/

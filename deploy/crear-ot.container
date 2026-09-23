@@ -1,0 +1,23 @@
+# Podman Quadlet (Rocky Linux 9): copy to ~/.config/containers/systemd/ (rootless)
+# or /etc/containers/systemd/ (root), then:
+#   systemctl --user daemon-reload && systemctl --user start crear-ot
+[Unit]
+Description=Crear OT - listener de Slack para creacion de OTs en Maximo
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+Image=localhost/crear-ot:latest
+ContainerName=crear-ot
+EnvironmentFile=%h/crear-ot/.env
+Volume=%h/crear-ot/data:/app/data:Z
+Volume=%h/crear-ot/logs:/app/logs:Z
+ShmSize=1g
+UserNS=keep-id:uid=1001,gid=1001
+
+[Service]
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

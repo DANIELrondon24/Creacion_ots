@@ -16,7 +16,6 @@ Features:
 - Input validation and edge case handling
 - Modular code structure with type hints
 - Production-ready with timeouts and scalability considerations
-
 Requirements:
 - Python 3.8+
 - pandas
@@ -42,7 +41,10 @@ Usage:
     HEADLESS=true  # optional, default true
     TIMEOUT=30000  # optional, default 30000ms
 
-    python unified_ot_creator.py
+    python main.py            # local: processes EXCEL_FILE_PATH
+
+Server mode (container): see server.py, which listens to the Slack channel
+SLACK_INPUT_CHANNEL_ID and processes each Excel uploaded by the workflow.
 """
 
 import os
@@ -53,6 +55,9 @@ from pathlib import Path
 from dataclasses import dataclass
 from enum import Enum
 from collections import defaultdict
+
+# Base directory of the project
+BASE_DIR = Path(__file__).resolve().parent
 
 
 # Constants
@@ -78,21 +83,33 @@ class Config:
     maximo_url: str
     slack_bot_token: str
     slack_channel_id: str
+    slack_app_token: str = ""
+    slack_input_channel_id: str = ""
+    data_dir: str = str(BASE_DIR / "data")
     headless: bool = True
     timeout: int = DEFAULT_TIMEOUT
 
     @classmethod
     def from_env(cls) -> "Config":
         """Create Config from environment variables."""
+        excel_path_env = os.getenv("EXCEL_FILE_PATH", "")
+        if excel_path_env:
+            excel_path = Path(excel_path_env)
+            if not excel_path.is_absolute():
+                excel_path_env = str(BASE_DIR / excel_path_env)
+
         return cls(
             username=os.getenv("MAXIMO_USERNAME", ""),
             password=os.getenv("MAXIMO_PASSWORD", ""),
-            excel_file_path=os.getenv("EXCEL_FILE_PATH", ""),
+            excel_file_path=excel_path_env,
             workshop_time=os.getenv("WORKSHOP_TIME", "3"),
             supervisor_id=os.getenv("SUPERVISOR_ID", ""),
             maximo_url=os.getenv("MAXIMO_URL", ""),
             slack_bot_token=os.getenv("SLACK_BOT_TOKEN", ""),
             slack_channel_id=os.getenv("SLACK_CHANNEL_ID", ""),
+            slack_app_token=os.getenv("SLACK_APP_TOKEN", ""),
+            slack_input_channel_id=os.getenv("SLACK_INPUT_CHANNEL_ID", ""),
+            data_dir=os.getenv("DATA_DIR", str(BASE_DIR / "data")),
             headless=os.getenv("HEADLESS", "true").lower() == "true",
             timeout=int(os.getenv("TIMEOUT", str(DEFAULT_TIMEOUT))),
         )
@@ -101,11 +118,14 @@ class Config:
 # Setup logging
 def setup_logging() -> logging.Logger:
     """Setup logging configuration."""
+    log_dir = Path(os.getenv("LOG_DIR", str(BASE_DIR)))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "ot_creator.log"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
         handlers=[
-            logging.FileHandler("ot_creator.log", encoding="utf-8"),
+            logging.FileHandler(str(log_file), encoding="utf-8"),
             logging.StreamHandler(),
         ],
     )
@@ -117,6 +137,7 @@ logger = setup_logging()
 # Import external modules with logging
 try:
     import pandas as pd
+    # pyrefly: ignore [missing-import]
     from dotenv import load_dotenv
     from playwright.sync_api import (
         sync_playwright,
@@ -141,7 +162,8 @@ except ImportError as e:
     raise
 
 # Load environment variables
-load_dotenv()
+env_path = BASE_DIR / ".env"
+load_dotenv(dotenv_path=env_path)
 
 # Word replacement dictionaries
 TYPE_REPLACEMENTS = {"HALL": "MCO"}
@@ -157,6 +179,12 @@ DESCRIPTION_REPLACEMENTS = {
 
 class MaximoAutomationError(Exception):
     """Custom exception for Maximo automation errors."""
+
+    pass
+
+
+class RowProcessingError(MaximoAutomationError):
+    """A specific Excel row could not be processed; execution must stop."""
 
     pass
 
@@ -186,7 +214,11 @@ class MaximoAutomator:
             self.playwright = sync_playwright().start()
             self.browser = self.playwright.chromium.launch(
                 headless=self.config.headless,
-                args=["--ignore-certificate-errors", "--allow-insecure-localhost"],
+                args=[
+                    "--ignore-certificate-errors",
+                    "--allow-insecure-localhost",
+                    "--disable-dev-shm-usage",
+                ],
             )
             self.context = self.browser.new_context(
                 viewport={"width": 2100, "height": 1100}
@@ -274,8 +306,13 @@ class MaximoAutomator:
 
         try:
             logger.info("Returning to list view...")
-            # Wait for and click the "Vista de lista" button
-            self.page.get_by_role("button", name="Vista de lista").click()
+            try:
+                self.page.get_by_role("button", name="Vista de lista").click(timeout=5000)
+            except Exception:
+                try:
+                    self.page.click("#toolactions_LISTVIEW-tbb", timeout=5000)
+                except Exception:
+                    self.page.click("text=Vista de lista", timeout=5000)
             time.sleep(3)  # Wait for the view to load
             logger.info("Successfully returned to list view")
         except Exception as e:
@@ -308,27 +345,30 @@ class MaximoAutomator:
         if not self.page:
             raise MaximoAutomationError("Browser not initialized")
 
+        placa = str(row.get("Placa", "")).strip() if pd.notna(row.get("Placa")) else ""
+        actividad = str(row.get("Actividad", "")).strip().title() if pd.notna(row.get("Actividad")) else ""
+
         try:
             logger.info(
-                f"Filling OT form for row {row_index + 1} - Plate: {row['Placa']}"
+                f"Filling OT form for row {row_index + 1} - Plate: {placa}"
             )
 
             # Activity
             self.page.wait_for_selector("#mad3161b5-tb2", timeout=self.config.timeout)
-            self.page.fill("#mad3161b5-tb2", row["Actividad"].title())
+            self.page.fill("#mad3161b5-tb2", actividad)
             time.sleep(0.5)
             self.page.press("#mad3161b5-tb2", "Tab")
 
             # License plate
             self.page.wait_for_selector("#m3b6a207f-tb", timeout=self.config.timeout)
-            self.page.fill("#m3b6a207f-tb", str(row["Placa"]))
+            self.page.fill("#m3b6a207f-tb", placa)
             time.sleep(0.5)
             self.page.press("#m3b6a207f-tb", "Tab")
             time.sleep(1)
 
             # Type
             self.page.wait_for_selector("#me2096203-tb", timeout=self.config.timeout)
-            tipo = str(row["Tipo"])
+            tipo = str(row.get("Tipo", "")).strip() if pd.notna(row.get("Tipo")) else ""
             for old, new in TYPE_REPLACEMENTS.items():
                 tipo = tipo.replace(old, new)
             self.page.fill("#me2096203-tb", tipo)
@@ -337,7 +377,7 @@ class MaximoAutomator:
 
             # Description Type
             self.page.wait_for_selector("#m78c05445-tb", timeout=self.config.timeout)
-            des_tipo = str(row["Descripcion_Tipo"])
+            des_tipo = str(row.get("Descripcion_Tipo", "")).strip() if pd.notna(row.get("Descripcion_Tipo")) else ""
             for old, new in DESCRIPTION_REPLACEMENTS.items():
                 des_tipo = des_tipo.replace(old, new)
             self.page.fill("#m78c05445-tb", des_tipo)
@@ -346,17 +386,21 @@ class MaximoAutomator:
 
             # Priority
             self.page.wait_for_selector("#m950e5295-tb", timeout=self.config.timeout)
-            self.page.fill("#m950e5295-tb", self.config.workshop_time)
+            self.page.fill("#m950e5295-tb", str(self.config.workshop_time))
             time.sleep(0.5)
             self.page.press("#m950e5295-tb", "Tab")
 
             # Scheduled Start
             self.page.wait_for_selector("#m8b12679c-tb", timeout=self.config.timeout)
-            fecha = row["Fecha"]
-            if isinstance(fecha, pd.Timestamp):
-                fecha_str = fecha.strftime("%d/%m/%Y")
-            else:
-                fecha_str = str(fecha)
+            fecha = row.get("Fecha")
+            try:
+                dt = pd.to_datetime(fecha)
+                if pd.notna(dt):
+                    fecha_str = dt.strftime("%d/%m/%Y")
+                else:
+                    fecha_str = str(fecha).strip()
+            except Exception:
+                fecha_str = str(fecha).strip()
             self.page.fill("#m8b12679c-tb", fecha_str)
             time.sleep(0.5)
             self.page.press("#m8b12679c-tb", "Tab")
@@ -364,112 +408,136 @@ class MaximoAutomator:
 
             # Supervisor
             self.page.wait_for_selector("#mb2eb834-tb", timeout=self.config.timeout)
-            self.page.fill("#mb2eb834-tb", self.config.supervisor_id)
+            self.page.fill("#mb2eb834-tb", str(self.config.supervisor_id))
             time.sleep(0.5)
             self.page.press("#mb2eb834-tb", "Tab")
             time.sleep(1)
 
-            # Extract OT number
+            # Extract OT number with multiple fallback selectors
             time.sleep(0.5)
-            ot_element = self.page.wait_for_selector(
+            ot_value = None
+            ot_selectors = [
                 "xpath=/html/body/form/div/table[2]/tbody/tr/td/table/tbody/tr/td/table/tbody/tr/td/table/tbody/tr[2]/td/div/table/tbody/tr[1]/td/table/tbody/tr[2]/td/table/tbody/tr[1]/td/div/table/tbody/tr[3]/td/table/tbody/tr/td[1]/div/table/tbody/tr[1]/td/div/table/tbody/tr/td/table/tbody/tr[1]/td[2]/input[1]",
-                timeout=self.config.timeout,
-            )
-            ot_value = ot_element.get_attribute("value")
-            logger.info(f"OT created: {ot_value} for plate: {row['Placa']}")
+                "input[id*='wonum']",
+                "input[id$='-tb1']",
+                "input[aria-label*='Orden de trabajo']",
+                "input[aria-label*='Work Order']",
+                "#m3b6a207f-tb1",
+            ]
+            for sel in ot_selectors:
+                try:
+                    ot_el = self.page.wait_for_selector(sel, timeout=3000)
+                    if ot_el:
+                        val = ot_el.get_attribute("value")
+                        if val and val.strip():
+                            ot_value = val.strip()
+                            break
+                except Exception:
+                    continue
+
+            if not ot_value:
+                val_js = self.page.evaluate("""() => {
+                    const el = document.querySelector('input[id*="wonum"], input[name*="wonum"], input[id$="-tb1"]');
+                    return el ? el.value : '';
+                }""")
+                if val_js and val_js.strip():
+                    ot_value = val_js.strip()
+
+            logger.info(f"OT created: {ot_value} for plate: {placa}")
 
             # Save OT
-            save_button = self.page.wait_for_selector(
-                "#toolactions_SAVE-tbb", timeout=self.config.timeout
-            )
             try:
+                save_button = self.page.wait_for_selector(
+                    "#toolactions_SAVE-tbb", timeout=self.config.timeout
+                )
                 save_button.click()
-                time.sleep(2)  # Wait for save to complete
+                time.sleep(2)
             except Exception:
-                # Try JavaScript click if regular click fails
                 self.page.evaluate(
-                    "document.querySelector('#toolactions_SAVE-tbb').click()"
+                    "document.querySelector('#toolactions_SAVE-tbb') && document.querySelector('#toolactions_SAVE-tbb').click()"
                 )
                 time.sleep(2)
 
             logger.info(f"OT {ot_value} saved successfully")
-            return ot_value
+            return ot_value or ""
 
         except Exception as e:
-            logger.error(f"Failed to fill OT form for plate {row['Placa']}: {e}")
+            logger.error(f"Failed to fill OT form for plate {placa}: {e}")
             raise MaximoAutomationError(f"Form filling failed: {e}")
 
 
-def send_file_to_slack(config: Config) -> bool:
-    """Send the Excel file to Slack channel with user confirmation.
-    
+def clean_ot(value: Any) -> str:
+    """Normalize an OT number: empty for NaN/None, without a float '.0' suffix."""
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if text.lower() in ("nan", "none"):
+        return ""
+    return text[:-2] if text.endswith(".0") else text
+
+
+def safe_save_excel(df: pd.DataFrame, file_path: str) -> bool:
+    """Safely save DataFrame to Excel, formatting OT numbers to avoid float '.0' suffixes."""
+    try:
+        if "OT" in df.columns:
+            df["OT"] = df["OT"].apply(clean_ot)
+        df.to_excel(file_path, index=False)
+        return True
+    except PermissionError:
+        logger.warning(f"Permission denied saving {file_path}. Excel file may be open in another application.")
+        print(f"\n⚠️ NO SE PUDO GUARDAR EN EXCEL: El archivo '{file_path}' está abierto en Microsoft Excel.")
+        print("   Por favor cierra el archivo para permitir actualizar las OTs.")
+        return False
+    except Exception as e:
+        logger.warning(f"Could not save to Excel: {e}")
+        return False
+
+
+def send_file_to_slack(config: Config, file_path: str, message: str) -> bool:
+    """Upload the Excel file to SLACK_CHANNEL_ID (non-interactive).
+
     Returns:
         bool: True if file was sent successfully, False otherwise
     """
     try:
-        # Ask user for confirmation
-        print("\n" + "=" * 80)
-        print("📤 ENVÍO A SLACK")
-        print("=" * 80)
-        print(f"Archivo a enviar: {config.excel_file_path}")
-        print(f"Canal de Slack: {config.slack_channel_id}")
-        print("\n¿Está todo correcto para enviar el archivo a Slack?")
-        
-        respuesta = input("Responde 'si' para enviar: ").strip().lower()
-        
-        if respuesta != "si":
-            logger.info("User cancelled Slack file upload")
-            print("❌ Envío cancelado por el usuario")
-            return False
-        
-        # Initialize Slack client
-        logger.info("Initializing Slack client...")
         client = WebClient(token=config.slack_bot_token)
-        
-        # Get current date and time
-        now = datetime.now()
-        fecha_hora = now.strftime("%d %b %Y %H:%M:%S")
-        
-        # Prepare message
-        mensaje = f"Archivo de creación de Ots\n{fecha_hora}"
-        
-        # Upload file
+        fecha_hora = datetime.now().strftime("%d %b %Y %H:%M:%S")
+
         logger.info(f"Uploading file to Slack channel {config.slack_channel_id}...")
         response = client.files_upload_v2(
             channel=config.slack_channel_id,
-            file=config.excel_file_path,
-            initial_comment=mensaje,
-            title=f"OTs - {fecha_hora}"
+            file=file_path,
+            initial_comment=f"{message}\n{fecha_hora}",
+            title=f"OTs - {fecha_hora}",
         )
-        
+
         if response["ok"]:
             logger.info("File uploaded to Slack successfully")
-            print(f"✅ Archivo enviado exitosamente a Slack")
-            print(f"   Mensaje: {mensaje}")
             return True
-        else:
-            logger.error(f"Slack upload failed: {response}")
-            print(f"❌ Error al enviar archivo a Slack")
-            return False
-            
+        logger.error(f"Slack upload failed: {response}")
+        return False
+
     except SlackApiError as e:
         logger.error(f"Slack API error: {e.response['error']}")
-        print(f"❌ Error de Slack API: {e.response['error']}")
         return False
     except Exception as e:
         logger.error(f"Failed to send file to Slack: {e}")
-        print(f"❌ Error al enviar archivo a Slack: {e}")
         return False
 
 
-def validate_config(config: Config) -> None:
+def validate_config(config: Config, server_mode: bool = False) -> None:
     """Validate configuration parameters."""
     errors = []
 
     if not config.username or not config.password:
         errors.append("Username and password are required")
 
-    if not config.excel_file_path:
+    if server_mode:
+        if not config.slack_app_token:
+            errors.append("Slack app token (SLACK_APP_TOKEN) is required")
+        if not config.slack_input_channel_id:
+            errors.append("Slack input channel (SLACK_INPUT_CHANNEL_ID) is required")
+    elif not config.excel_file_path:
         errors.append("Excel file path is required")
     elif not Path(config.excel_file_path).exists():
         errors.append(f"Excel file not found: {config.excel_file_path}")
@@ -546,14 +614,17 @@ def group_by_functional_unit(df: pd.DataFrame) -> Dict[FunctionalUnit, pd.DataFr
 
 def process_ot_creation_multi_unit(
     config: Config,
+    excel_path: str,
 ) -> Dict[FunctionalUnit, List[Tuple[int, str]]]:
     """Process OT creation for multiple functional units from the same Excel file.
 
-    STOPS execution if any row fails and prompts user to fix the error.
+    STOPS execution on the first failing row (raises MaximoAutomationError).
+    OTs created so far are already saved in the Excel file, so it can be
+    re-uploaded after fixing the error: rows with an OT are skipped.
     """
-    # Load and group data
-    df = pd.read_excel(config.excel_file_path)
-    logger.info(f"Loaded {len(df)} rows from Excel file: {config.excel_file_path}")
+    # Load and group data safely as strings for OT column
+    df = pd.read_excel(excel_path, dtype={"OT": str})
+    logger.info(f"Loaded {len(df)} rows from Excel file: {excel_path}")
 
     # Initialize OT column if it doesn't exist
     if "OT" not in df.columns:
@@ -582,17 +653,13 @@ def process_ot_creation_multi_unit(
                 # Process each row for this unit
                 for idx, (original_index, row) in enumerate(unit_df.iterrows()):
                     # Check if OT already exists for this row
-                    existing_ot = df.at[original_index, "OT"]
-                    if (
-                        existing_ot
-                        and str(existing_ot).strip() != ""
-                        and str(existing_ot).lower() != "nan"
-                    ):
+                    clean_existing = clean_ot(df.at[original_index, "OT"])
+                    if clean_existing:
                         logger.info(
-                            f"Skipping row {original_index + 1} - OT already exists: {existing_ot}"
+                            f"Skipping row {original_index + 1} - OT already exists: {clean_existing}"
                         )
                         print(
-                            f"⏭️  Fila {original_index + 1} omitida - OT ya existe: {existing_ot} (Placa: {row['Placa']})"
+                            f"⏭️  Fila {original_index + 1} omitida - OT ya existe: {clean_existing} (Placa: {row['Placa']})"
                         )
                         continue
 
@@ -605,71 +672,29 @@ def process_ot_creation_multi_unit(
 
                             # Save OT immediately to Excel
                             df.at[original_index, "OT"] = ot
-                            try:
-                                df.to_excel(config.excel_file_path, index=False)
+                            if safe_save_excel(df, excel_path):
                                 logger.info(f"OT {ot} saved to Excel immediately")
-                            except Exception as save_error:
-                                logger.warning(
-                                    f"Could not save to Excel immediately: {save_error}"
-                                )
 
                             logger.info(
                                 f"Progress: {idx + 1}/{len(unit_df)} OTs created for {unit.value}"
                             )
                             time.sleep(3)  # Wait between OTs
                         else:
-                            # OT was not saved - PAUSE and let user fix
-                            logger.error(f"OT not saved for row {original_index + 1}")
-                            print(
-                                f"\n❌ ERROR: No se pudo guardar la OT para la fila {original_index + 1}"
-                            )
-                            print(f"   Móvil: {row['Movil']}")
-                            print(f"   Placa: {row['Placa']}")
-                            print(f"\n📋 INSTRUCCIONES:")
-                            print(f"   1. Corrige el error manualmente en Maximo")
-                            print(f"   2. NO cierres el navegador")
-                            print(
-                                f"   3. Cuando hayas terminado, presiona ENTER para continuar con la siguiente fila"
-                            )
-                            print(
-                                f"\n✓ Las OTs creadas hasta ahora ya están guardadas en el Excel."
+                            raise RowProcessingError(
+                                f"No se pudo obtener el número de OT para la fila {original_index + 1} "
+                                f"(Móvil: {row['Movil']}, Placa: {row['Placa']})"
                             )
 
-                            input(
-                                "\n⏸️  Presiona ENTER cuando hayas corregido el error y quieras continuar..."
-                            )
-                            logger.info(
-                                f"User confirmed error fixed, continuing with next row"
-                            )
-                            continue  # Skip to next row
-
-                    except MaximoAutomationError:
-                        # Re-raise MaximoAutomationError to stop execution
+                    except RowProcessingError:
+                        safe_save_excel(df, excel_path)
                         raise
                     except Exception as e:
-                        # Any other error - PAUSE and let user fix
                         logger.error(f"Failed to process row {original_index + 1}: {e}")
-                        print(f"\n❌ ERROR en la fila {original_index + 1}:")
-                        print(f"   Móvil: {row['Movil']}")
-                        print(f"   Placa: {row['Placa']}")
-                        print(f"   Error: {str(e)}")
-                        print(f"\n📋 INSTRUCCIONES:")
-                        print(f"   1. Corrige el error manualmente en Maximo")
-                        print(f"   2. NO cierres el navegador")
-                        print(
-                            f"   3. Cuando hayas terminado, presiona ENTER para continuar con la siguiente fila"
-                        )
-                        print(
-                            f"\n✓ Las OTs creadas hasta ahora ya están guardadas en el Excel."
-                        )
-
-                        input(
-                            "\n⏸️  Presiona ENTER cuando hayas corregido el error y quieras continuar..."
-                        )
-                        logger.info(
-                            f"User confirmed error fixed for row {original_index + 1}, continuing with next row"
-                        )
-                        continue  # Skip to next row
+                        safe_save_excel(df, excel_path)
+                        raise RowProcessingError(
+                            f"Error en la fila {original_index + 1} "
+                            f"(Móvil: {row['Movil']}, Placa: {row['Placa']}): {e}"
+                        ) from e
 
                 # After completing all OTs for this unit, return to list view
                 # (except if this is the last unit being processed)
@@ -684,17 +709,6 @@ def process_ot_creation_multi_unit(
                     except Exception as e:
                         logger.error(
                             f"Failed to return to list view after {unit.value}: {e}"
-                        )
-                        print(
-                            f"\n⚠️ ADVERTENCIA: No se pudo regresar a la vista de lista."
-                        )
-                        print(f"   Error: {str(e)}")
-                        print(f"\n📋 INSTRUCCIONES:")
-                        print(
-                            f"   1. Haz clic manualmente en el botón 'Vista de lista'"
-                        )
-                        print(
-                            f"   2. Vuelve a ejecutar el script para continuar con la siguiente unidad"
                         )
                         raise MaximoAutomationError(
                             f"Failed to return to list view: {e}"
@@ -717,11 +731,10 @@ def process_ot_creation_multi_unit(
 
     # Final save to ensure all OTs are in the Excel file
     logger.info("\nPerforming final save of Excel file...")
-    try:
-        df.to_excel(config.excel_file_path, index=False)
-        logger.info(f"Excel file saved successfully: {config.excel_file_path}")
-    except Exception as e:
-        logger.warning(f"Final save failed, but OTs were saved incrementally: {e}")
+    if safe_save_excel(df, excel_path):
+        logger.info(f"Excel file saved successfully: {excel_path}")
+    else:
+        logger.warning("Final save warning, but OTs were saved incrementally if file was unlocked")
 
     return all_ots
 
@@ -745,7 +758,7 @@ def main():
         logger.info(f"  - Timeout: {config.timeout}ms")
 
         # Process OT creation
-        all_ots = process_ot_creation_multi_unit(config)
+        all_ots = process_ot_creation_multi_unit(config, config.excel_file_path)
 
         # Summary
         logger.info("\n" + "=" * 80)
@@ -766,13 +779,24 @@ def main():
         print("✓ Por favor verifica que estén correctas en el sistema Maximo.")
         print(f"✓ El archivo Excel ha sido actualizado: {config.excel_file_path}")
         
-        # Send file to Slack
+        # Send file to Slack (local mode asks for confirmation)
         if total_ots > 0:
-            send_file_to_slack(config)
+            print(f"\n¿Enviar el archivo al canal de Slack {config.slack_channel_id}?")
+            try:
+                respuesta = input("Responde 'si' para enviar: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                respuesta = ""
+            if respuesta == "si":
+                if send_file_to_slack(config, config.excel_file_path, "Archivo de creación de Ots"):
+                    print("✅ Archivo enviado exitosamente a Slack")
+                else:
+                    print("❌ Error al enviar archivo a Slack (ver log)")
+            else:
+                print("❌ Envío cancelado por el usuario")
 
     except MaximoAutomationError as e:
         logger.error(f"Automation error: {e}")
-        print(f"\n⚠️ El proceso se detuvo debido a un error.")
+        print(f"\n⚠️ El proceso se detuvo debido a un error: {e}")
         print(f"⚠️ Revisa el archivo 'ot_creator.log' para más detalles.")
     except Exception as e:
         logger.error(f"Script execution failed: {e}", exc_info=True)
