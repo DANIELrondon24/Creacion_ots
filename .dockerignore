@@ -1,0 +1,16 @@
+.env
+.git
+venv/
+.venv/
+__pycache__/
+*.log
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+desktop.ini
+*.bat
+Nueva carpeta/
+data/
+logs/
+unified_ot_creator_backup.py

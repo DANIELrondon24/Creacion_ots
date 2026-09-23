@@ -3,3 +3,4 @@ python-dotenv
 playwright
 tenacity
 slack-sdk
+openpyxl
